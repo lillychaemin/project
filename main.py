@@ -1,11 +1,12 @@
 # -*- coding: utf-8 -*-
 """
-전국 고령화 지도 (Streamlit 앱)
+전국 고등학생 지도 (Streamlit 앱)
 
-- 시군구별 65세 이상 인구 비율(고령화율)을 5단계 색으로 칠한 단계구분도입니다.
+- 시군구별 17세 이상 19세 이하 인구 비율을 5단계 색으로 칠한 단계구분도입니다.
 - 인구 데이터와 경계 데이터는 GitHub에서 바로 내려받아 사용합니다.
 - 지역은 '이름'이 아니라 '코드(5자리)'로 맞춥니다.
   (예: '남구'는 여러 시도에 있어서 이름으로 맞추면 어긋납니다.)
+- 색을 나누는 경계값은 전국 시군구를 다섯 덩어리(5분위)로 나눠 자동으로 계산합니다.
 """
 
 import io
@@ -24,20 +25,18 @@ import streamlit as st
 POP_URL = "https://raw.githubusercontent.com/greatsong/modudata/main/data/population_yearly.csv.gz"
 GEO_URL = "https://raw.githubusercontent.com/greatsong/modudata/main/data/boundaries/sigungu_kr.geojson"
 
-# 단계를 나누는 경계값(%) — 전국 시군구를 다섯 덩어리로 나눈 값입니다.
-BREAKS = [19, 23, 28, 38]
+# 대상 나이: 17세 이상 19세 이하
+AGE_MIN = 17
+AGE_MAX = 19
+
+# 구간 경계값(%)을 직접 정하고 싶으면 4개의 숫자를 넣으세요. 예: [2.5, 3.0, 3.5, 4.0]
+# None 이면 전국 시군구를 다섯 덩어리로 나누는 값(5분위수)을 데이터에서 자동 계산합니다.
+MANUAL_BREAKS = None
 
 # 낮은 쪽은 옅게, 높은 쪽은 진하게 (5단계 색)
-COLORS = ["#fef0d9", "#fdcc8a", "#fc8d59", "#e34a33", "#b30000"]
+COLORS = ["#eff3ff", "#bdd7e7", "#6baed6", "#3182bd", "#08519c"]
 
-# 범례에 보일 글자: '19% 미만', '19% 이상 ~ 23% 미만', ..., '38% 이상'
-LABELS = (
-    [f"{BREAKS[0]}% 미만"]
-    + [f"{BREAKS[i]}% 이상 ~ {BREAKS[i + 1]}% 미만" for i in range(len(BREAKS) - 1)]
-    + [f"{BREAKS[-1]}% 이상"]
-)
-
-# '계_65세', '계_100세 이상' 같은 열 이름에서 나이 숫자를 뽑는 규칙
+# '계_17세', '계_100세 이상' 같은 열 이름에서 나이 숫자를 뽑는 규칙
 AGE_COLUMN = re.compile(r"^계_(\d+)세")
 
 ONE_DAY = 60 * 60 * 24  # 캐시 유지 시간(초)
@@ -48,7 +47,7 @@ ONE_DAY = 60 * 60 * 24  # 캐시 유지 시간(초)
 # ─────────────────────────────────────────────
 @st.cache_data(ttl=ONE_DAY, show_spinner=False)
 def load_population():
-    """인구 CSV를 읽어 '가장 최신 연도'의 시군구별 고령화율을 계산합니다."""
+    """인구 CSV를 읽어 '가장 최신 연도'의 시군구별 17~19세 비율을 계산합니다."""
     resp = requests.get(POP_URL, timeout=120)
     resp.raise_for_status()
     raw = resp.content
@@ -90,17 +89,19 @@ def load_population():
             df[col].astype(str).str.replace(",", "", regex=False), errors="coerce"
         )
     all_cols = list(age_columns)
-    old_cols = [col for col, age in age_columns.items() if age >= 65]  # 65세 이상 열
+    target_cols = [c for c, age in age_columns.items() if AGE_MIN <= age <= AGE_MAX]  # 17~19세 열
+    if not target_cols:
+        raise ValueError(f"{AGE_MIN}~{AGE_MAX}세 열을 찾지 못했습니다.")
     df[all_cols] = df[all_cols].fillna(0)
 
     # 읍·면·동 단위 → 시군구 단위로 합치기 (코드 앞 5자리 = 시군구)
     df["시군구코드"] = df["코드"].astype(str).str.strip().str[:5]
     df["전체"] = df[all_cols].sum(axis=1)
-    df["고령"] = df[old_cols].sum(axis=1)
+    df["대상"] = df[target_cols].sum(axis=1)
 
-    agg = df.groupby("시군구코드", as_index=False)[["전체", "고령"]].sum()
+    agg = df.groupby("시군구코드", as_index=False)[["전체", "대상"]].sum()
     agg = agg[agg["전체"] > 0].copy()
-    agg["고령화율"] = agg["고령"] / agg["전체"] * 100
+    agg["비율"] = agg["대상"] / agg["전체"] * 100
     return agg, latest_year
 
 
@@ -116,13 +117,38 @@ def load_geojson():
 
 
 # ─────────────────────────────────────────────
-# 3. 지도 그리기
+# 3. 구간(단계) 만들기
 # ─────────────────────────────────────────────
-def build_map(df, geo):
+def get_breaks(ratios):
+    """5단계를 나누는 경계값 4개를 정합니다."""
+    if MANUAL_BREAKS is not None:
+        return [float(b) for b in MANUAL_BREAKS]
+
+    # 전국 시군구를 다섯 덩어리로 나누는 값: 20% · 40% · 60% · 80% 지점
+    q = np.quantile(ratios, [0.2, 0.4, 0.6, 0.8])
+    rounded = np.round(q, 2)  # 범례가 보기 좋게 소수 둘째 자리까지
+    if np.all(np.diff(rounded) > 0):  # 반올림해도 순서가 유지되면 반올림한 값 사용
+        q = rounded
+    return [float(b) for b in q]
+
+
+def make_labels(breaks):
+    """범례에 보일 글자: '2.50% 미만', '2.50% 이상 ~ 3.00% 미만', ..., '4.00% 이상'"""
+    return (
+        [f"{breaks[0]:.2f}% 미만"]
+        + [f"{breaks[i]:.2f}% 이상 ~ {breaks[i + 1]:.2f}% 미만" for i in range(len(breaks) - 1)]
+        + [f"{breaks[-1]:.2f}% 이상"]
+    )
+
+
+# ─────────────────────────────────────────────
+# 4. 지도 그리기
+# ─────────────────────────────────────────────
+def build_map(df, geo, labels):
     """5단계 구간마다 트레이스를 하나씩 만들어 색과 범례(글자)를 붙입니다."""
     fig = go.Figure()
 
-    for label, color in zip(LABELS, COLORS):
+    for label, color in zip(labels, COLORS):
         part = df[df["구간"] == label]
         if part.empty:
             continue
@@ -146,11 +172,11 @@ def build_map(df, geo):
                 showlegend=True,  # 범례에 구간 글자 표시
                 marker_line_color="#888888",
                 marker_line_width=0.4,
-                customdata=part[["시군구", "시도", "고령화율"]].to_numpy(),
+                customdata=part[["시군구", "시도", "비율"]].to_numpy(),
                 hovertemplate=(
                     "<b>%{customdata[0]}</b><br>"
                     "시도: %{customdata[1]}<br>"
-                    "고령화율: %{customdata[2]:.1f}%"
+                    "고등학생 비율: %{customdata[2]:.2f}%"
                     "<extra></extra>"
                 ),
             )
@@ -161,23 +187,23 @@ def build_map(df, geo):
     fig.update_layout(
         height=720,
         margin=dict(l=0, r=0, t=10, b=0),
-        legend=dict(title="65세 이상 인구 비율", itemsizing="constant"),
+        legend=dict(title=f"{AGE_MIN}~{AGE_MAX}세 인구 비율", itemsizing="constant"),
     )
     return fig
 
 
 # ─────────────────────────────────────────────
-# 4. 순위 표 만들기
+# 5. 순위 표 만들기
 # ─────────────────────────────────────────────
 def make_rank_table(part):
-    """순위 · 시도 · 시군구 · 고령화율 · 65세 이상 인구 표를 만듭니다."""
+    """순위 · 시도 · 시군구 · 고등학생 비율 · 17~19세 인구 표를 만듭니다."""
     table = pd.DataFrame(
         {
             "순위": range(1, len(part) + 1),
             "시도": part["시도"].to_numpy(),
             "시군구": part["시군구"].to_numpy(),
-            "고령화율(%)": part["고령화율"].round(1).to_numpy(),
-            "65세 이상(명)": [f"{int(n):,}" for n in part["고령"]],
+            "고등학생 비율(%)": part["비율"].round(2).to_numpy(),
+            f"{AGE_MIN}~{AGE_MAX}세(명)": [f"{int(n):,}" for n in part["대상"]],
         }
     )
     return table
@@ -188,17 +214,17 @@ def show_table(table):
         table,
         hide_index=True,
         column_config={
-            "고령화율(%)": st.column_config.NumberColumn(format="%.1f"),
+            "고등학생 비율(%)": st.column_config.NumberColumn(format="%.2f"),
         },
     )
 
 
 # ─────────────────────────────────────────────
-# 5. 화면 구성
+# 6. 화면 구성
 # ─────────────────────────────────────────────
-st.set_page_config(page_title="전국 고령화 지도", page_icon="🗺️", layout="wide")
+st.set_page_config(page_title="전국 고등학생 지도", page_icon="🎒", layout="wide")
 
-st.title("🗺️ 전국 고령화 지도")
+st.title("🎒 전국 고등학생 지도")
 
 try:
     with st.spinner("데이터를 불러오는 중입니다..."):
@@ -214,13 +240,17 @@ regions = pd.DataFrame([f["properties"] for f in geo["features"]])[["코드", "�
 # 지역 '코드'로 인구 데이터와 경계 데이터를 연결 (이름으로 연결하지 않음!)
 data = regions.merge(pop, left_on="코드", right_on="시군구코드", how="inner")
 
-# 고령화율을 5단계로 나누기 (19 이상이면 다음 구간: 예) 19.0% → '19% 이상 ~ 23% 미만')
+# 비율을 5단계로 나누기 (경계값과 같으면 윗 구간: 예) 딱 3.00% → '3.00% 이상 ~ ...')
+breaks = get_breaks(data["비율"])
+labels = make_labels(breaks)
 data["구간"] = pd.cut(
-    data["고령화율"], bins=[-np.inf, *BREAKS, np.inf], labels=LABELS, right=False
+    data["비율"], bins=[-np.inf, *breaks, np.inf], labels=labels, right=False
 ).astype(str)
 
 st.caption(
-    f"{year}년 기준 · 시군구별 65세 이상 인구 비율(%) · 지도에 표시된 시군구 {len(data)}곳"
+    f"{year}년 기준 · 시군구별 전체 인구 중 {AGE_MIN}세 이상 {AGE_MAX}세 이하 비율(%) "
+    f"· 고등학생 연령대 인구를 뜻하며 실제 재학생 수와는 다를 수 있어요"
+    f"· 지도에 표시된 시군구 {len(data)}곳"
 )
 
 # 코드가 서로 맞지 않는 지역이 있으면 알려 주기
@@ -233,18 +263,18 @@ if no_pop or no_geo:
     )
 
 # 지도
-st.plotly_chart(build_map(data, geo))
+st.plotly_chart(build_map(data, geo, labels))
 
 # 지도 아래: 높은 곳 10 / 낮은 곳 10 을 표 두 개로 나란히
-st.subheader("고령화율 순위")
+st.subheader("고등학생 비율 순위")
 left, right = st.columns(2)
 
 with left:
-    st.markdown("**🔺 고령화율이 높은 곳 10곳**")
-    show_table(make_rank_table(data.sort_values("고령화율", ascending=False).head(10)))
+    st.markdown("**🔺 고등학생 비율이 높은 곳 10곳**")
+    show_table(make_rank_table(data.sort_values("비율", ascending=False).head(10)))
 
 with right:
-    st.markdown("**🔻 고령화율이 낮은 곳 10곳**")
-    show_table(make_rank_table(data.sort_values("고령화율", ascending=True).head(10)))
+    st.markdown("**🔻 고등학생 비율이 낮은 곳 10곳**")
+    show_table(make_rank_table(data.sort_values("비율", ascending=True).head(10)))
 
 st.caption("출처: greatsong/modudata (인구: population_yearly.csv.gz, 경계: sigungu_kr.geojson)")
